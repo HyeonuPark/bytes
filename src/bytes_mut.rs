@@ -478,6 +478,12 @@ impl BytesMut {
     /// modifying the data, so it is up to the caller to ensure that the data
     /// has been initialized.
     ///
+    /// # Safety
+    ///
+    /// The behavior of this function (or subsequent operations) is undefined if:
+    ///
+    /// * `len` is larger than the capacity of the underlying buffer.
+    ///
     /// # Examples
     ///
     /// ```
