@@ -17,7 +17,7 @@ use alloc::{boxed::Box, vec::Vec};
 ///
 /// The simplest `BufMut` is a `Vec<u8>`.
 ///
-/// ```
+/// ```rust
 /// use bytes::BufMut;
 ///
 /// let mut buf = vec![];
@@ -26,6 +26,14 @@ use alloc::{boxed::Box, vec::Vec};
 ///
 /// assert_eq!(buf, b"hello world");
 /// ```
+///
+/// # Safety
+///
+/// This trait is marked `unsafe` because it involves many potentially operations
+/// including:
+///
+/// * Advancing read offsets in slices which aren't guaranteed to contain initialized memory
+///
 pub unsafe trait BufMut {
     /// Returns the number of bytes that can be written from the current
     /// position until the end of the buffer is reached.
@@ -51,7 +59,7 @@ pub unsafe trait BufMut {
     /// assert_eq!(original_remaining - 5, buf.remaining_mut());
     /// ```
     ///
-    /// # Implementer notes
+    /// # Safety
     ///
     /// Implementations of `remaining_mut` should ensure that the return value
     /// does not change unless a call is made to `advance_mut` or any other
@@ -67,8 +75,12 @@ pub unsafe trait BufMut {
     /// The next call to `chunk_mut` will return a slice starting `cnt` bytes
     /// further into the underlying buffer.
     ///
-    /// This function is unsafe because there is no guarantee that the bytes
-    /// being advanced past have been initialized.
+    /// # Safety
+    ///
+    /// This implementation may result in undefined behavior if:
+    ///
+    /// * The cursor is advanced past the point where data has been written.
+    ///     * This could result in the access of invalid or uninitialized memory.
     ///
     /// # Examples
     ///

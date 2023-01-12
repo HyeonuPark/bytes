@@ -31,9 +31,9 @@ use crate::Buf;
 /// implementations of `Bytes`.
 ///
 /// All `Bytes` implementations must fulfill the following requirements:
-/// - They are cheaply cloneable and thereby shareable between an unlimited amount
+/// * They are cheaply cloneable and thereby shareable between an unlimited amount
 ///   of components, for example by modifying a reference count.
-/// - Instances can be sliced to refer to a subset of the the original buffer.
+/// * Instances can be sliced to refer to a subset of the the original buffer.
 ///
 /// ```
 /// use bytes::Bytes;
@@ -105,33 +105,108 @@ pub struct Bytes {
     data: AtomicPtr<()>,
     vtable: &'static Vtable,
 }
-/// A trait for underlying implementations for `Bytes` type.
+/// Interop contract that enables buffer types to convert to and from [`Bytes`] instances.
 ///
 /// All implementations must fulfill the following requirements:
-/// - They are cheaply cloneable and thereby shareable between an unlimited amount
-///   of components, for example by modifying a reference count.
-/// - Instances can be sliced to refer to a subset of the the original buffer.
+/// * They are cheaply cloneable and thereby shareable between an unlimited number
+///   of instances. For example by modifying a reference count.
+/// * Instances can be sliced to refer to a subset of the the original buffer.
+///
+///  # Safety
+///
+///  Usage of the [`BytesImpl`] and the resulting [`Bytes`] object is undefined
+///  unless the functions in this trait produce:
+///     * A Valid pointer to a the container object in the form of an [`AtomicPtr`]. For refcounting
+///     and reconstruction/downcasting.
+///     * A Valid pointer to a single, contiguous data slice as (`const *u8`) where:
+///         * The data slice is guaranteed to exist until the [`drop`] function is called.
+///         * The data slice must not be mutated for the lifetime of the container.
+///     * The supplied `len` must be less than or equal to the actual data slice in memory.
+///     * The total size len must be no larger than isize::MAX. See the safety documentation of pointer::offset.
 pub unsafe trait BytesImpl: 'static {
     /// Decompose `Self` into parts used by `Bytes`.
     fn into_bytes_parts(this: Self) -> (AtomicPtr<()>, *const u8, usize);
 
-    /// Creates itself directly from the raw bytes parts decomposed with `into_bytes_parts`.
+    /// Produces the necessary components to contsruct a [`Bytes`] instance.
+    ///
+    /// # Safety
+    ///
+    /// This implementation must conform to the guarantees described in the the `Safety`
+    /// section of this [`BytesImpl`] trait.
+    ///
     unsafe fn from_bytes_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self;
 
-    /// Returns new `Bytes` based on the current parts.
-    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes;
+    /// Returns a clone of `Bytes` using the current data pointer, buffer pointer, and len
+    ///
+    /// Should cheaply clone the object without copying the data where possible. If the underlying
+    /// data implementation is cheaply cloneable, this should be trivial to implement.
+    ///
+    /// # Safety
+    ///
+    /// This implementation must conform to the guarantees described in the the `Safety`
+    /// secotion of this [`BytesImpl`] trait.
+    ///
+    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
+        let dptr = AtomicPtr::load(data, Ordering::Acquire);
+
+        Bytes {
+            ptr,
+            len,
+            data: AtomicPtr::new(dptr.cast()),
+            vtable: &Vtable {
+                type_id: TypeId::of::<Self>,
+                clone: Self::clone,
+                will_truncate: Self::will_truncate,
+                into_vec: Self::into_vec,
+                drop: Self::drop,
+            },
+        }
+    }
 
     /// Called before the `Bytes::truncate` is processed.
-    /// Useful if the implementation needs some preparation step for it.
+    ///
+    /// Implementations of `BytesImpl` must be able to produce correct results
+    /// using the `len` property. As an optimization, some implementations do
+    /// transparently refer to their underlying buffer, until some copy-on-write activity
+    /// forces them to restructure.  This method should invoke that necessary restructuring.
+    ///
+    /// # Safety
+    ///
+    /// If the underlying impl doesn't constrain itself by the len parameter, then future calls
+    /// to slice will return a slice of incorrect size. This can result in runtime panics
+    /// or other undefined behavior.
     unsafe fn will_truncate(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) {
         // do nothing by default
         let _ = (data, ptr, len);
     }
 
-    /// Consumes underlying resources and return `Vec<u8>`
+    /// Consumes this instance and converts it into a `Vec<u8>`
+    ///
+    /// The `Bytes` instance for which this is called may not be unique, nor
+    /// is it guaranteed to be pointing to the original buffer. `Vec<u8>` expects
+    /// to own its contents. Therefore, this function will likely require a copy
+    /// from the original buffer into one that is owned by the Vec.
+    ///
+    /// # Safety
+    ///
+    /// The resulting Vec will be invalid unless the implementation:
+    ///
+    /// * Ensures that no other objects own the buffer pointed to by the new Vec.
+    /// * The len used by the Vec is valid for its buffer, and matches the supplied `len`
+    ///
+    /// If you are avoiding allocation, and passing control of the buffer to the Vec, then
+    /// you should ensure that all [`required invariants`] are met when constructing the Vec.
+    ///
+    /// [`required invariants`]: https://doc.rust-lang.org/std/vec/struct.Vec.html#safety
     unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8>;
 
-    /// Release underlying resources.
+    /// Release or decrement the refcount of the underlying resources.
+    ///
+    /// # Safety
+    ///
+    /// If this implementation deallocates the underlying buffer, it must ensure
+    /// that there are no other instances referring to it. Otherwise the behavior will
+    /// be undefined.
     unsafe fn drop(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize);
 }
 
