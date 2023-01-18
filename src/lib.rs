@@ -87,8 +87,11 @@ mod bytes;
 mod bytes_mut;
 mod fmt;
 mod loom;
-pub use crate::bytes::{Bytes, BytesImpl};
+mod managed_buf;
+mod impls;
+pub use crate::bytes::Bytes;
 pub use crate::bytes_mut::BytesMut;
+pub use crate::managed_buf::ManagedBuf;
 
 // Optional Serde support
 #[cfg(feature = "serde")]
