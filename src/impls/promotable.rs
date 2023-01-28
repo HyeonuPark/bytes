@@ -4,7 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem, ptr, usize};
-use crate::managed_buf::{ ManagedBuf, ManagedBufError, BufferParts };
+use crate::refcount_buf::{ RefCountBuf, RefCountBufError, Parts };
 
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
@@ -25,8 +25,8 @@ pub(crate) enum Promotable {
     Shared(SharedImpl),
 }
 
-unsafe impl ManagedBuf for PromotableEvenImpl {
-    fn into_parts(this: Self) -> (AtomicPtr<()>, *const u8, usize) {
+unsafe impl RefCountBuf for PromotableEvenImpl {
+    fn into_parts(this: Self) -> (RefCountPtr, *const u8, usize) {
         let slice = match this.0 {
             Promotable::Owned(slice) => slice,
             Promotable::Shared(shared) => return SharedImpl::into_parts(shared),
@@ -41,13 +41,13 @@ unsafe impl ManagedBuf for PromotableEvenImpl {
         (AtomicPtr::new(data.cast()), ptr, len)
     }
 
-    unsafe fn from_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self {
+    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self {
         PromotableEvenImpl(promotable_from_bytes_parts(data, ptr, len, |shared| {
             ptr_map(shared.cast(), |addr| addr & !KIND_MASK)
         }))
     }
 
-    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> BufferParts {
+    unsafe fn clone(data: &RefCountPtr, ptr: *const u8, len: usize) -> Parts {
         let shared = data.load(Ordering::Acquire);
         let kind = shared as usize & KIND_MASK;
 
@@ -61,11 +61,11 @@ unsafe impl ManagedBuf for PromotableEvenImpl {
     }
 
     unsafe fn try_resize(
-        data: &mut AtomicPtr<()>,
+        data: &mut RefCountPtr,
         ptr: *const u8,
         len: usize,
         _can_alloc: bool,
-    ) -> Result<Option<BufferParts>, ManagedBufError> {
+    ) -> Result<Option<Parts>, RefCountBufError> {
         // The Vec "promotable" vtables do not store the capacity,
         // so we cannot truncate while using this repr. We *have* to
         // promote using `clone` so the capacity can be stored.
@@ -73,13 +73,13 @@ unsafe impl ManagedBuf for PromotableEvenImpl {
         Ok(None)
     }
 
-    unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
         promotable_into_vec(data, ptr, len, |shared| {
             ptr_map(shared.cast(), |addr| addr & !KIND_MASK)
         })
     }
 
-    unsafe fn drop(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) {
+    unsafe fn drop(data: &mut RefCountPtr, ptr: *const u8, len: usize) {
         data.with_mut(|shared| {
             let shared = *shared;
             let kind = shared as usize & KIND_MASK;
@@ -96,7 +96,7 @@ unsafe impl ManagedBuf for PromotableEvenImpl {
 }
 
 unsafe fn promotable_from_bytes_parts(
-    data: &mut AtomicPtr<()>,
+    data: &mut RefCountPtr,
     ptr: *const u8,
     len: usize,
     f: fn(*mut ()) -> *mut u8,
@@ -120,7 +120,7 @@ unsafe fn promotable_from_bytes_parts(
 }
 
 unsafe fn promotable_into_vec(
-    data: &mut AtomicPtr<()>,
+    data: &mut RefCountPtr,
     ptr: *const u8,
     len: usize,
     f: fn(*mut ()) -> *mut u8,
@@ -145,8 +145,8 @@ unsafe fn promotable_into_vec(
     }
 }
 
-unsafe impl ManagedBuf for PromotableOddImpl {
-    fn into_parts(this: Self) -> BufferParts {
+unsafe impl RefCountBuf for PromotableOddImpl {
+    fn into_parts(this: Self) -> Parts {
         let slice = match this.0 {
             Promotable::Owned(slice) => slice,
             Promotable::Shared(shared) => return SharedImpl::into_parts(shared),
@@ -159,13 +159,13 @@ unsafe impl ManagedBuf for PromotableOddImpl {
         (AtomicPtr::new(ptr.cast()), ptr, len)
     }
 
-    unsafe fn from_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self {
+    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self {
         PromotableOddImpl(promotable_from_bytes_parts(data, ptr, len, |shared| {
             shared.cast()
         }))
     }
 
-    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> BufferParts {
+    unsafe fn clone(data: &RefCountPtr, ptr: *const u8, len: usize) -> Parts {
         let shared = data.load(Ordering::Acquire);
         let kind = shared as usize & KIND_MASK;
 
@@ -178,11 +178,11 @@ unsafe impl ManagedBuf for PromotableOddImpl {
     }
 
     unsafe fn try_resize(
-        data: &mut AtomicPtr<()>,
+        data: &mut RefCountPtr,
         ptr: *const u8,
         len: usize,
         can_alloc: bool,
-    ) -> Result<Option<BufferParts>, ManagedBufError> {
+    ) -> Result<Option<Parts>, RefCountBufError> {
         // The Vec "promotable" vtables do not store the capacity,
         // so we cannot truncate while using this repr. We *have* to
         // promote using `clone` so the capacity can be stored.
@@ -190,11 +190,11 @@ unsafe impl ManagedBuf for PromotableOddImpl {
         Ok(None)
     }
 
-    unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
         promotable_into_vec(data, ptr, len, |shared| shared.cast())
     }
 
-    unsafe fn drop(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) {
+    unsafe fn drop(data: &mut RefCountPtr, ptr: *const u8, len: usize) {
         data.with_mut(|shared| {
             let shared = *shared;
             let kind = shared as usize & KIND_MASK;
@@ -245,12 +245,12 @@ where
 
 #[cold]
 unsafe fn shallow_clone_vec(
-    atom: &AtomicPtr<()>,
+    atom: &RefCountPtr,
     ptr: *const (),
     buf: *mut u8,
     offset: *const u8,
     len: usize,
-) -> BufferParts {
+) -> Parts {
     // If  the buffer is still tracked in a `Vec<u8>`. It is time to
     // promote the vec to an `Arc`. This could potentially be called
     // concurrently, so some care must be taken.

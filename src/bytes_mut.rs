@@ -15,9 +15,9 @@ use alloc::{
 use crate::buf::{IntoIter, UninitSlice};
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
-use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use crate::ManagedBuf;
-use crate::managed_buf::BufferParts;
+use crate::loom::sync::atomic::{AtomicUsize, Ordering};
+use crate::RefCountBuf;
+use crate::refcount_buf::Parts;
 use crate::{Buf, BufMut, Bytes};
 
 /// A unique reference to a contiguous slice of memory.
@@ -1680,12 +1680,12 @@ struct SharedImpl {
     len: usize,
 }
 
-unsafe impl ManagedBuf for SharedImpl {
-    fn into_parts(this: Self) -> (AtomicPtr<()>, *const u8, usize) {
+unsafe impl RefCountBuf for SharedImpl {
+    fn into_parts(this: Self) -> (RefCountPtr, *const u8, usize) {
         (AtomicPtr::new(this.shared.cast()), this.ptr, this.len)
     }
 
-    unsafe fn from_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self {
+    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self {
         SharedImpl {
             shared: (data.with_mut(|p| *p)).cast(),
             ptr,
@@ -1693,14 +1693,14 @@ unsafe impl ManagedBuf for SharedImpl {
         }
     }
 
-    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> BufferParts {
+    unsafe fn clone(data: &RefCountPtr, ptr: *const u8, len: usize) -> Parts {
         let shared = data.load(Ordering::Relaxed) as *mut Shared;
         increment_shared(shared);
 
         (AtomicPtr::new(shared.cast()), ptr, len)
     }
 
-    unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
         let shared: *mut Shared = (data.with_mut(|p| *p)).cast();
 
         if (*shared).is_unique() {
@@ -1722,7 +1722,7 @@ unsafe impl ManagedBuf for SharedImpl {
         }
     }
 
-    unsafe fn drop(data: &mut AtomicPtr<()>, _ptr: *const u8, _len: usize) {
+    unsafe fn drop(data: &mut RefCountPtr, _ptr: *const u8, _len: usize) {
         data.with_mut(|shared| {
             release_shared(*shared as *mut Shared);
         });

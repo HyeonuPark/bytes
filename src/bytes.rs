@@ -7,12 +7,9 @@ use alloc::{borrow::Borrow, boxed::Box, string::String, vec::Vec};
 
 use crate::buf::IntoIter;
 use crate::impls::*;
-#[allow(unused)]
-use crate::loom::sync::atomic::AtomicMut;
-use crate::loom::sync::atomic::AtomicPtr;
-use crate::managed_buf::{BufferParts, ManagedBuf, ManagedBufError};
+use crate::loom::sync::atomic::{AtomicPtr, Ordering};
+use crate::refcount_buf::{RefCountBuf, RefCountBufError};
 use crate::Buf;
-
 /// A cheaply cloneable and sliceable chunk of contiguous memory.
 ///
 /// `Bytes` is an efficient container for storing and operating on contiguous
@@ -97,35 +94,8 @@ use crate::Buf;
 pub struct Bytes {
     ptr: *const u8,
     len: usize,
-    // inlined "trait object"
-    data: AtomicPtr<()>,
-    vtable: &'static Vtable,
-}
-
-struct Vtable {
-    type_id: fn() -> TypeId,
-    /// fn(data, ptr, len)
-    clone: unsafe fn(&AtomicPtr<()>, *const u8, usize) -> BufferParts,
-    /// Called during `Bytes::try_resize` and `Bytes::truncate`
-    try_resize: unsafe fn(
-        &mut AtomicPtr<()>,
-        *const u8,
-        usize,
-        bool,
-    ) -> Result<Option<BufferParts>, ManagedBufError>,
-    /// For conversion from Bytes to BytesMut
-    try_into_mut: unsafe fn(
-        &mut AtomicPtr<()>,
-        *const u8,
-        usize,
-        bool,
-    ) -> Result<BufferParts, ManagedBufError>,
-    /// fn(data, ptr, len)
-    ///
-    /// Consumes `Bytes` and return `Vec<u8>`
-    into_vec: unsafe fn(&mut AtomicPtr<()>, *const u8, usize) -> Vec<u8>,
-    /// fn(data, ptr, len)
-    drop: unsafe fn(&mut AtomicPtr<()>, *const u8, usize),
+    // inlined "trait object". Effectively it is `AtomicPtr<dyn RefCountBuf>`
+    data: AtomicPtr<Box<dyn RefCountBuf>>,
 }
 
 impl Bytes {
@@ -171,62 +141,38 @@ impl Bytes {
     /// ```
     #[inline]
     #[cfg(not(all(loom, test)))]
-    pub const fn from_static(bytes: &'static [u8]) -> Bytes {
-        const STATIC_VTABLE: Vtable = Vtable {
-            type_id: TypeId::of::<static_buf::StaticImpl>,
-            clone: <static_buf::StaticImpl as ManagedBuf>::clone,
-            try_resize: <static_buf::StaticImpl as ManagedBuf>::try_resize,
-            try_into_mut: <static_buf::StaticImpl as ManagedBuf>::try_into_mut,
-            into_vec: <static_buf::StaticImpl as ManagedBuf>::into_vec,
-            drop: <static_buf::StaticImpl as ManagedBuf>::drop,
-        };
+    pub const fn from_static(buf: &'static [u8]) -> Bytes {
+        use crate::impls::static_buf::StaticImpl;
 
-        Bytes {
-            ptr: bytes.as_ptr(),
-            len: bytes.len(),
-            data: AtomicPtr::new(ptr::null_mut()),
-            vtable: &STATIC_VTABLE,
-        }
+        let imp: Box<dyn RefCountBuf> = Box::new(StaticImpl(buf));
+        let (ptr, len) = unsafe { imp.slice() };
+        let data = AtomicPtr::new(imp);
+        Bytes { ptr, len, data }
     }
 
     #[cfg(all(loom, test))]
     pub fn from_static(bytes: &'static [u8]) -> Bytes {
-        const STATIC_VTABLE: Vtable = Vtable {
-            type_id: TypeId::of::<static_buf::StaticImpl>,
-            clone: <static_buf::StaticImpl as ManagedBuf>::clone,
-            will_truncate: <static_buf::StaticImpl as ManagedBuf>::will_truncate,
-            into_vec: <static_buf::StaticImpl as ManagedBuf>::into_vec,
-            drop: <static_buf::StaticImpl as ManagedBuf>::drop,
-        };
+        use crate::impls::static_buf::StaticImpl;
 
-        Bytes {
-            ptr: bytes.as_ptr(),
-            len: bytes.len(),
-            data: AtomicPtr::new(ptr::null_mut()),
-            vtable: &STATIC_VTABLE,
-        }
-    }
-
-    /// Creates a new `Bytes` from `ManagedBuf` implementation.
-    ///
-    /// Useful if you want to construct `Bytes` from your own buffer implementation.
-    #[inline]
-    pub fn with_impl<T: ManagedBuf>(buf_impl: T) -> Bytes {
-        let (data, ptr, len) = ManagedBuf::into_parts(buf_impl);
-
+        let imp = crate::impls::static_buf::StaticImpl(buf);
+        let data_ptr: *mut dyn RefCountBuf = &mut imp;
+        let (data, ptr, len) = unsafe { (*data_ptr).as_parts() };
         Bytes {
             ptr,
             len,
             data,
-            vtable: &Vtable {
-                type_id: TypeId::of::<T>,
-                clone: T::clone,
-                try_resize: T::try_resize,
-                try_into_mut: T::try_into_mut,
-                into_vec: T::into_vec,
-                drop: T::drop,
-            },
+            type_id: TypeId::of::<StaticImpl>(),
         }
+    }
+
+    /// Creates a new `Bytes` from `RefCountBuf` implementation.
+    ///
+    /// Useful if you want to construct `Bytes` from your own buffer implementation.
+    #[inline]
+    pub fn from_impl(buf_impl: Box<dyn RefCountBuf>) -> Bytes {
+        let (ptr, len) = buf_impl.slice();
+        let data = AtomicPtr::new(buf_impl);
+        Bytes { ptr, len, data }
     }
 
     /// Returns the number of bytes contained in this `Bytes`.
@@ -507,7 +453,9 @@ impl Bytes {
     pub fn truncate(&mut self, len: usize) {
         if len < self.len {
             unsafe {
-                (self.vtable.try_resize)(&mut self.data, self.ptr, self.len, false);
+                let ptr: ptr::NonNull<dyn RefCountBuf> =
+                    mem::transmute(self.data.load(Ordering::Relaxed));
+                ptr.as_ref().try_resize(self.ptr, self.len, false);
             }
             self.len = len;
         }
@@ -531,11 +479,12 @@ impl Bytes {
 
     /// Downcast this `Bytes` into its underlying implementation.
     #[inline]
-    pub fn downcast_impl<T: ManagedBuf>(self) -> Result<T, Bytes> {
-        if TypeId::of::<T>() == (self.vtable.type_id)() {
+    pub fn downcast_impl<T: RefCountBuf>(self) -> Result<T, Bytes> {
+        if TypeId::of::<T>() == self.type_id {
             Ok(unsafe {
                 let this = &mut *mem::ManuallyDrop::new(self);
-                T::from_parts(&mut this.data, this.ptr, this.len)
+                let ptr: *const T = this.data.load(Ordering::Relaxed) as *const T;
+                ptr.read()
             })
         } else {
             Err(self)
@@ -565,19 +514,27 @@ unsafe impl Sync for Bytes {}
 impl Drop for Bytes {
     #[inline]
     fn drop(&mut self) {
-        unsafe { (self.vtable.drop)(&mut self.data, self.ptr, self.len) }
+        unsafe {
+            let ptr: ptr::NonNull<dyn RefCountBuf> =
+                mem::transmute(self.data.load(Ordering::Relaxed));
+            ptr.as_ref().drop(self.ptr, self.len)
+        }
     }
 }
 
 impl Clone for Bytes {
     #[inline]
     fn clone(&self) -> Bytes {
-        let (data, ptr, len) = unsafe { (self.vtable.clone)(&self.data, self.ptr, self.len) };
+        let (data, ptr, len) = unsafe {
+            let ptr: ptr::NonNull<dyn RefCountBuf> =
+                mem::transmute(self.data.load(Ordering::Relaxed));
+            ptr.as_ref().clone(&self.data, self.ptr, self.len)
+        };
         Bytes {
+            type_id: self.type_id,
             ptr,
             len,
-            data,
-            vtable: self.vtable,
+            data: self.data,
         }
     }
 }
@@ -871,11 +828,11 @@ impl From<Box<[u8]>> for Bytes {
         }
 
         if slice.as_ptr() as usize & 0x1 == 0 {
-            Bytes::with_impl(promotable::PromotableEvenImpl(
+            Bytes::from_impl(promotable::PromotableEvenImpl(
                 promotable::Promotable::Owned(slice),
             ))
         } else {
-            Bytes::with_impl(promotable::PromotableOddImpl(
+            Bytes::from_impl(promotable::PromotableOddImpl(
                 promotable::Promotable::Owned(slice),
             ))
         }
@@ -891,26 +848,12 @@ impl From<String> for Bytes {
 impl From<Bytes> for Vec<u8> {
     fn from(bytes: Bytes) -> Vec<u8> {
         let bytes = &mut *mem::ManuallyDrop::new(bytes);
-        unsafe { (bytes.vtable.into_vec)(&mut bytes.data, bytes.ptr, bytes.len) }
+        unsafe {
+            let ptr: *mut dyn RefCountBuf = mem::transmute(bytes.data.load(Ordering::Relaxed));
+            (*ptr).into_vec(bytes.ptr, bytes.len)
+        }
     }
 }
-
-// ===== impl Vtable =====
-
-impl fmt::Debug for Vtable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Vtable")
-            .field("type_id", &self.type_id)
-            .field("clone", &(self.clone as *const ()))
-            .field("try_resize", &(self.try_resize as *const ()))
-            .field("try_into_mut", &(self.try_into_mut as *const ()))
-            .field("into_vec", &(self.into_vec as *const ()))
-            .field("drop", &(self.drop as *const ()))
-            .finish()
-    }
-}
-
-// compile-fails
 
 /// ```compile_fail
 /// use bytes::Bytes;

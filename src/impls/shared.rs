@@ -4,7 +4,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem, ptr, slice, usize};
-use crate::managed_buf::{ ManagedBuf, BufferParts };
+use crate::refcount_buf::{ RefCountBuf, RefCountPtr, RefCountUSize, RefCountBufError, Parts };
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -36,12 +36,12 @@ pub(crate) struct SharedImpl {
     len: usize,
 }
 
-unsafe impl ManagedBuf for SharedImpl {
-    fn into_parts(this: Self) -> (AtomicPtr<()>, *const u8, usize) {
-        (AtomicPtr::new(this.shared.cast()), this.offset, this.len)
+unsafe impl RefCountBuf for SharedImpl {
+    fn into_parts(this: Self) -> (RefCountPtr, *const u8, usize) {
+        (RefCountPtr::new(this.shared.cast()), this.offset, this.len)
     }
 
-    unsafe fn from_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self {
+    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self {
         SharedImpl {
             shared: (data.with_mut(|p| *p)).cast(),
             offset: ptr,
@@ -49,16 +49,16 @@ unsafe impl ManagedBuf for SharedImpl {
         }
     }
 
-    unsafe fn clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> BufferParts {
+    unsafe fn clone(data: &RefCountPtr, ptr: *const u8, len: usize) -> Parts {
         let shared = data.load(Ordering::Relaxed);
         shallow_clone_arc(shared as _, ptr, len)
     }
 
-    unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
         shared_into_vec_impl((data.with_mut(|p| *p)).cast(), ptr, len)
     }
 
-    unsafe fn drop(data: &mut AtomicPtr<()>, _ptr: *const u8, _len: usize) {
+    unsafe fn drop(data: &mut RefCountPtr, _ptr: *const u8, _len: usize) {
         data.with_mut(|shared| {
             release_shared(shared.cast());
         });
@@ -94,7 +94,7 @@ pub(crate) unsafe fn shared_into_vec_impl(shared: *mut Shared, ptr: *const u8, l
     }
 }
 
-pub(crate) unsafe fn shallow_clone_arc(shared: *mut Shared, ptr: *const u8, len: usize) -> BufferParts {
+pub(crate) unsafe fn shallow_clone_arc(shared: *mut Shared, ptr: *const u8, len: usize) -> Parts {
     let old_size = (*shared).ref_cnt.fetch_add(1, Ordering::Relaxed);
 
     if old_size > usize::MAX >> 1 {

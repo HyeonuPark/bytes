@@ -87,11 +87,12 @@ mod bytes;
 mod bytes_mut;
 mod fmt;
 mod loom;
-mod managed_buf;
+mod refcount_buf;
 mod impls;
+mod thin_box;
 pub use crate::bytes::Bytes;
 pub use crate::bytes_mut::BytesMut;
-pub use crate::managed_buf::ManagedBuf;
+pub use crate::refcount_buf::RefCountBuf;
 
 // Optional Serde support
 #[cfg(feature = "serde")]

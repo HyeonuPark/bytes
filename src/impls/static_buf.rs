@@ -1,39 +1,46 @@
-#[allow(unused)]
-use crate::loom::sync::atomic::AtomicPtr;
+use crate::refcount_buf::{Parts, RefCountBuf, RefCountBufError, RefCountPtr};
 use core::{ptr, slice, usize};
-use crate::managed_buf::{ ManagedBuf, BufferParts };
+use crate::refcount_buf::{ RefCountBuf, Parts };
 use alloc::vec::Vec;
 // ===== impl StaticVtable =====
 
-pub(crate) struct StaticImpl(&'static [u8]);
+pub struct StaticImpl(pub &'static [u8]);
 
-unsafe impl ManagedBuf for StaticImpl {
+unsafe impl RefCountBuf for StaticImpl {
 
-    fn into_parts(this: Self) ->  BufferParts {
-        (AtomicPtr::new(ptr::null_mut()),
-        this.0.as_ptr(),
-        this.0.len(),)
+    fn as_parts(&self) ->  Parts {
+        let ptr : *const dyn RefCountBuf = self as &dyn RefCountBuf;
+        let data = unsafe { RefCountPtr::new(std::mem::transmute(ptr)) };
+        (data,
+        self.0.as_ptr(),
+        self.0.len(),)
     }
 
-    unsafe fn from_parts(_data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self {
-        StaticImpl(slice::from_raw_parts(ptr, len))
-    }
-
-    unsafe fn clone(_: &AtomicPtr<()>, ptr: *const u8, len: usize) -> BufferParts {
+    unsafe fn clone(&self, data: &RefCountPtr, ptr: *const u8, len: usize) -> (&RefCountPtr, *const u8, usize) {
         let slice = slice::from_raw_parts(ptr, len);
-
-        (AtomicPtr::new(ptr::null_mut()), slice.as_ptr(), slice.len())
+        
+        (data, slice.as_ptr(), slice.len())
     }
 
-    unsafe fn into_vec(_: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(&self, _: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
         let slice = slice::from_raw_parts(ptr, len);
         slice.to_vec()
     }
 
-    //unsafe fn try_into_mut(&self, can_alloc: bool) -> Result<BufferParts, ManagedBufError> {
+    unsafe fn try_resize(
+        &self,
+
+        ptr: *const u8,
+        len: usize,
+        can_alloc: bool,
+    ) -> Result<(), RefCountBufError> {
+        let data = k  
+    }
+
+    //unsafe fn try_into_mut(&self, can_alloc: bool) -> Result<Parts, RefCountBufError> {
     //}
 
-    unsafe fn drop(_: &mut AtomicPtr<()>, _: *const u8, _: usize) {
+    unsafe fn drop(_: &mut RefCountPtr, _: *const u8, _: usize) {
         // nothing to drop for &'static [u8]
     }
 }

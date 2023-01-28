@@ -30,7 +30,7 @@ use alloc::{
 ///     * The total size len must be no larger than isize::MAX. See the safety documentation of pointer::offset.
 pub unsafe trait SharedBuf: 'static + Sized {
     /// Decompose `Self` into parts used by other shared buffer types
-    fn into_parts(this: Self) -> (AtomicPtr<()>, *const u8, usize);
+    fn into_parts(this: Self) -> (RefCountPtr, *const u8, usize);
 
     /// Produces the necessary components to construct a [`Bytes`] instance.
     ///
@@ -39,7 +39,7 @@ pub unsafe trait SharedBuf: 'static + Sized {
     /// This implementation must conform to the guarantees described in the the `Safety`
     /// section of this [`SharedBuf`] trait.
     ///
-    unsafe fn from_parts(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Self;
+    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self;
 
     /// Attempts a clone of Self using the current data pointer, buffer pointer, and len
     ///
@@ -52,7 +52,7 @@ pub unsafe trait SharedBuf: 'static + Sized {
     /// section of this [`SharedBuf`] trait.
     ///
     unsafe fn try_clone<T: SharedBuf + Sized>(
-        data: &AtomicPtr<()>,
+        data: &RefCountPtr,
         ptr: *const u8,
         len: usize,
     ) -> CloneResult<Self, T>;
@@ -70,7 +70,7 @@ pub unsafe trait SharedBuf: 'static + Sized {
     /// to slice will return a slice of incorrect size. This can result in runtime panics
     /// or other undefined behavior.
     unsafe fn try_truncate(
-        data: &mut AtomicPtr<()>,
+        data: &mut RefCountPtr,
         ptr: *const u8,
         len: usize,
     ) -> Result<(), SharedBufError> {
@@ -97,7 +97,7 @@ pub unsafe trait SharedBuf: 'static + Sized {
     /// you should ensure that all [`required invariants`] are met when constructing the Vec.
     ///
     /// [`required invariants`]: https://doc.rust-lang.org/std/vec/struct.Vec.html#safety
-    unsafe fn into_vec(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize) -> Vec<u8>;
+    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8>;
 
     /// Release or decrement the refcount of the underlying resources.
     ///
@@ -106,7 +106,7 @@ pub unsafe trait SharedBuf: 'static + Sized {
     /// If this implementation deallocates the underlying buffer, it must ensure
     /// that there are no other instances referring to it. Otherwise the behavior will
     /// be undefined.
-    unsafe fn drop(data: &mut AtomicPtr<()>, ptr: *const u8, len: usize);
+    unsafe fn drop(data: &mut RefCountPtr, ptr: *const u8, len: usize);
 }
 
 #[derive(Debug)]
