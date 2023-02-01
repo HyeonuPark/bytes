@@ -3,19 +3,21 @@ pub(crate) mod sync {
     pub(crate) mod atomic {
         pub(crate) use portable_atomic::{AtomicU128, AtomicUsize, Ordering};
 
-        pub(crate) trait AtomicMut<T> {
+        pub(crate) trait AtomicMut {
+            type Size; 
             fn with_mut<F, R>(&mut self, f: F) -> R
             where
-                F: FnOnce(&mut *mut T) -> R;
+                F: FnOnce(&mut Self::Size) -> R;
         }
 
-        impl<T> AtomicMut<T> for AtomicU128 {
+        impl AtomicMut for AtomicU128 {
+            type Size = u128; 
             fn with_mut<F, R>(&mut self, f: F) -> R
             where
-                F: FnOnce(&mut *mut T) -> R,
+                F: FnOnce(&mut Self::Size) -> R,
             {
-                let ptr: *mut dyn T = unsafe { std::mem::transmute(self.load(Ordering::Relaxed)) };
-                f(&mut ptr)
+                let data = self.load(Ordering::Relaxed);
+                f(&mut data)
             }
         }
     }
@@ -24,8 +26,6 @@ pub(crate) mod sync {
 #[cfg(all(test, loom))]
 pub(crate) mod sync {
     pub(crate) mod atomic {
-        pub(crate) use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-
-        pub(crate) trait AtomicMut<T> {}
+        pub(crate) use loom::sync::atomic::{AtomicU128, AtomicMut, AtomicUsize, Ordering};
     }
 }

@@ -6,9 +6,12 @@ use core::{cmp, fmt, hash, mem, ptr, slice, usize};
 use alloc::{borrow::Borrow, boxed::Box, string::String, vec::Vec};
 
 use crate::buf::IntoIter;
+use crate::dyn_ptr_to_ref;
 use crate::impls::*;
-use crate::loom::sync::atomic::{AtomicPtr, Ordering};
-use crate::refcount_buf::{RefCountBuf, RefCountBufError};
+use crate::loom::sync::atomic::Ordering;
+use crate::refcount_buf::{
+    AtomicMutPtr, RefCountBuf, RefCountBufError, RefCountPtr, RefCountUSize,
+};
 use crate::Buf;
 /// A cheaply cloneable and sliceable chunk of contiguous memory.
 ///
@@ -95,7 +98,7 @@ pub struct Bytes {
     ptr: *const u8,
     len: usize,
     // inlined "trait object". Effectively it is `AtomicPtr<dyn RefCountBuf>`
-    data: AtomicPtr<Box<dyn RefCountBuf>>,
+    data: RefCountPtr,
 }
 
 impl Bytes {
@@ -142,11 +145,9 @@ impl Bytes {
     #[inline]
     #[cfg(not(all(loom, test)))]
     pub const fn from_static(buf: &'static [u8]) -> Bytes {
-        use crate::impls::static_buf::StaticImpl;
-
         let imp: Box<dyn RefCountBuf> = Box::new(StaticImpl(buf));
         let (ptr, len) = unsafe { imp.slice() };
-        let data = AtomicPtr::new(imp);
+        let data = unsafe { dyn_ptr_to_ref!(Box::into_raw(imp)) };
         Bytes { ptr, len, data }
     }
 
@@ -171,7 +172,8 @@ impl Bytes {
     #[inline]
     pub fn from_impl(buf_impl: Box<dyn RefCountBuf>) -> Bytes {
         let (ptr, len) = buf_impl.slice();
-        let data = AtomicPtr::new(buf_impl);
+        let dptr = Box::into_raw(buf_impl);
+        let data = unsafe { dyn_ptr_to_ref!(dptr) };
         Bytes { ptr, len, data }
     }
 
@@ -480,15 +482,11 @@ impl Bytes {
     /// Downcast this `Bytes` into its underlying implementation.
     #[inline]
     pub fn downcast_impl<T: RefCountBuf>(self) -> Result<T, Bytes> {
-        if TypeId::of::<T>() == self.type_id {
-            Ok(unsafe {
-                let this = &mut *mem::ManuallyDrop::new(self);
-                let ptr: *const T = this.data.load(Ordering::Relaxed) as *const T;
-                ptr.read()
-            })
-        } else {
-            Err(self)
-        }
+        Ok(unsafe {
+            let this = &mut *mem::ManuallyDrop::new(self);
+            let ptr: *const T = this.data.load(Ordering::Relaxed) as *const T;
+            ptr.read()
+        })
     }
 
     // private
@@ -515,9 +513,8 @@ impl Drop for Bytes {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            let ptr: ptr::NonNull<dyn RefCountBuf> =
-                mem::transmute(self.data.load(Ordering::Relaxed));
-            ptr.as_ref().drop(self.ptr, self.len)
+            self.data
+                .with_mut_ptr(|rcbuf| (**rcbuf).drop(self.ptr, self.len))
         }
     }
 }
@@ -528,10 +525,9 @@ impl Clone for Bytes {
         let (data, ptr, len) = unsafe {
             let ptr: ptr::NonNull<dyn RefCountBuf> =
                 mem::transmute(self.data.load(Ordering::Relaxed));
-            ptr.as_ref().clone(&self.data, self.ptr, self.len)
+            ptr.as_ref().clone(self.ptr, self.len)
         };
         Bytes {
-            type_id: self.type_id,
             ptr,
             len,
             data: self.data,
@@ -826,16 +822,7 @@ impl From<Box<[u8]>> for Bytes {
         if slice.is_empty() {
             return Bytes::new();
         }
-
-        if slice.as_ptr() as usize & 0x1 == 0 {
-            Bytes::from_impl(promotable::PromotableEvenImpl(
-                promotable::Promotable::Owned(slice),
-            ))
-        } else {
-            Bytes::from_impl(promotable::PromotableOddImpl(
-                promotable::Promotable::Owned(slice),
-            ))
-        }
+        Bytes::from_impl(Box::new(BoxedSlice::new(slice)))
     }
 }
 

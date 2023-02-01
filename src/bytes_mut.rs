@@ -16,8 +16,7 @@ use crate::buf::{IntoIter, UninitSlice};
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{AtomicUsize, Ordering};
-use crate::RefCountBuf;
-use crate::refcount_buf::Parts;
+use crate::{ RefCountBuf, RefCountPtr };
 use crate::{Buf, BufMut, Bytes};
 
 /// A unique reference to a contiguous slice of memory.
@@ -63,52 +62,8 @@ pub struct BytesMut {
     ptr: NonNull<u8>,
     len: usize,
     cap: usize,
-    data: *mut Shared,
+    data: RefCountPtr, 
 }
-
-// Thread-safe reference-counted container for the shared storage. This mostly
-// the same as `core::sync::Arc` but without the weak counter. The ref counting
-// fns are based on the ones found in `std`.
-//
-// The main reason to use `Shared` instead of `core::sync::Arc` is that it ends
-// up making the overall code simpler and easier to reason about. This is due to
-// some of the logic around setting `Inner::arc` and other ways the `arc` field
-// is used. Using `Arc` ended up requiring a number of funky transmutes and
-// other shenanigans to make it work.
-struct Shared {
-    vec: Vec<u8>,
-    original_capacity_repr: usize,
-    ref_count: AtomicUsize,
-}
-
-// Buffer storage strategy flags.
-const KIND_ARC: usize = 0b0;
-const KIND_VEC: usize = 0b1;
-const KIND_MASK: usize = 0b1;
-
-// The max original capacity value. Any `Bytes` allocated with a greater initial
-// capacity will default to this.
-const MAX_ORIGINAL_CAPACITY_WIDTH: usize = 17;
-// The original capacity algorithm will not take effect unless the originally
-// allocated capacity was at least 1kb in size.
-const MIN_ORIGINAL_CAPACITY_WIDTH: usize = 10;
-// The original capacity is stored in powers of 2 starting at 1kb to a max of
-// 64kb. Representing it as such requires only 3 bits of storage.
-const ORIGINAL_CAPACITY_MASK: usize = 0b11100;
-const ORIGINAL_CAPACITY_OFFSET: usize = 2;
-
-// When the storage is in the `Vec` representation, the pointer can be advanced
-// at most this value. This is due to the amount of storage available to track
-// the offset is usize - number of KIND bits and number of ORIGINAL_CAPACITY
-// bits.
-const VEC_POS_OFFSET: usize = 5;
-const MAX_VEC_POS: usize = usize::MAX >> VEC_POS_OFFSET;
-const NOT_VEC_POS_MASK: usize = 0b11111;
-
-#[cfg(target_pointer_width = "64")]
-const PTR_WIDTH: usize = 64;
-#[cfg(target_pointer_width = "32")]
-const PTR_WIDTH: usize = 32;
 
 /*
  *
@@ -251,12 +206,11 @@ impl BytesMut {
             }
         } else {
             debug_assert_eq!(self.kind(), KIND_ARC);
-
             let ptr = self.ptr.as_ptr();
             let len = self.len;
             let shared = self.data;
             mem::forget(self);
-            Bytes::with_impl(SharedImpl { shared, ptr, len })
+            Bytes::from_impl(Box::new(SharedImpl { shared, ptr, len }))
         }
     }
 
@@ -927,38 +881,6 @@ impl BytesMut {
         self.data as usize & KIND_MASK
     }
 
-    unsafe fn promote_to_shared(&mut self, ref_cnt: usize) {
-        debug_assert_eq!(self.kind(), KIND_VEC);
-        debug_assert!(ref_cnt == 1 || ref_cnt == 2);
-
-        let original_capacity_repr =
-            (self.data as usize & ORIGINAL_CAPACITY_MASK) >> ORIGINAL_CAPACITY_OFFSET;
-
-        // The vec offset cannot be concurrently mutated, so there
-        // should be no danger reading it.
-        let off = (self.data as usize) >> VEC_POS_OFFSET;
-
-        // First, allocate a new `Shared` instance containing the
-        // `Vec` fields. It's important to note that `ptr`, `len`,
-        // and `cap` cannot be mutated without having `&mut self`.
-        // This means that these fields will not be concurrently
-        // updated and since the buffer hasn't been promoted to an
-        // `Arc`, those three fields still are the components of the
-        // vector.
-        let shared = Box::new(Shared {
-            vec: rebuild_vec(self.ptr.as_ptr(), self.len, self.cap, off),
-            original_capacity_repr,
-            ref_count: AtomicUsize::new(ref_cnt),
-        });
-
-        let shared = Box::into_raw(shared);
-
-        // The pointer should be aligned, so this assert should
-        // always succeed.
-        debug_assert_eq!(shared as usize & KIND_MASK, KIND_ARC);
-
-        self.data = shared;
-    }
 
     /// Makes an exact shallow clone of `self`.
     ///
@@ -977,31 +899,6 @@ impl BytesMut {
         }
     }
 
-    #[inline]
-    unsafe fn get_vec_pos(&mut self) -> (usize, usize) {
-        debug_assert_eq!(self.kind(), KIND_VEC);
-
-        let prev = self.data as usize;
-        (prev >> VEC_POS_OFFSET, prev)
-    }
-
-    #[inline]
-    unsafe fn set_vec_pos(&mut self, pos: usize, prev: usize) {
-        debug_assert_eq!(self.kind(), KIND_VEC);
-        debug_assert!(pos <= MAX_VEC_POS);
-
-        self.data = invalid_ptr((pos << VEC_POS_OFFSET) | (prev & NOT_VEC_POS_MASK));
-    }
-
-    #[inline]
-    fn uninit_slice(&mut self) -> &mut UninitSlice {
-        unsafe {
-            let ptr = self.ptr.as_ptr().add(self.len);
-            let len = self.cap - self.len;
-
-            UninitSlice::from_raw_parts_mut(ptr, len)
-        }
-    }
 }
 
 impl Drop for BytesMut {
@@ -1305,78 +1202,6 @@ impl<'a> FromIterator<&'a u8> for BytesMut {
  *
  */
 
-unsafe fn increment_shared(ptr: *mut Shared) {
-    let old_size = (*ptr).ref_count.fetch_add(1, Ordering::Relaxed);
-
-    if old_size > isize::MAX as usize {
-        crate::abort();
-    }
-}
-
-unsafe fn release_shared(ptr: *mut Shared) {
-    // `Shared` storage... follow the drop steps from Arc.
-    if (*ptr).ref_count.fetch_sub(1, Ordering::Release) != 1 {
-        return;
-    }
-
-    // This fence is needed to prevent reordering of use of the data and
-    // deletion of the data.  Because it is marked `Release`, the decreasing
-    // of the reference count synchronizes with this `Acquire` fence. This
-    // means that use of the data happens before decreasing the reference
-    // count, which happens before this fence, which happens before the
-    // deletion of the data.
-    //
-    // As explained in the [Boost documentation][1],
-    //
-    // > It is important to enforce any possible access to the object in one
-    // > thread (through an existing reference) to *happen before* deleting
-    // > the object in a different thread. This is achieved by a "release"
-    // > operation after dropping a reference (any access to the object
-    // > through this reference must obviously happened before), and an
-    // > "acquire" operation before deleting the object.
-    //
-    // [1]: (www.boost.org/doc/libs/1_55_0/doc/html/atomic/usage_examples.html)
-    //
-    // Thread sanitizer does not support atomic fences. Use an atomic load
-    // instead.
-    (*ptr).ref_count.load(Ordering::Acquire);
-
-    // Drop the data
-    drop(Box::from_raw(ptr));
-}
-
-impl Shared {
-    fn is_unique(&self) -> bool {
-        // The goal is to check if the current handle is the only handle
-        // that currently has access to the buffer. This is done by
-        // checking if the `ref_count` is currently 1.
-        //
-        // The `Acquire` ordering synchronizes with the `Release` as
-        // part of the `fetch_sub` in `release_shared`. The `fetch_sub`
-        // operation guarantees that any mutations done in other threads
-        // are ordered before the `ref_count` is decremented. As such,
-        // this `Acquire` will guarantee that those mutations are
-        // visible to the current thread.
-        self.ref_count.load(Ordering::Acquire) == 1
-    }
-}
-
-#[inline]
-fn original_capacity_to_repr(cap: usize) -> usize {
-    let width = PTR_WIDTH - ((cap >> MIN_ORIGINAL_CAPACITY_WIDTH).leading_zeros() as usize);
-    cmp::min(
-        width,
-        MAX_ORIGINAL_CAPACITY_WIDTH - MIN_ORIGINAL_CAPACITY_WIDTH,
-    )
-}
-
-fn original_capacity_from_repr(repr: usize) -> usize {
-    if repr == 0 {
-        return 0;
-    }
-
-    1 << (repr + (MIN_ORIGINAL_CAPACITY_WIDTH - 1))
-}
 
 /*
 #[test]
@@ -1635,17 +1460,6 @@ fn vptr(ptr: *mut u8) -> NonNull<u8> {
     }
 }
 
-/// Returns a dangling pointer with the given address. This is used to store
-/// integer data in pointer fields.
-///
-/// It is equivalent to `addr as *mut T`, but this fails on miri when strict
-/// provenance checking is enabled.
-#[inline]
-fn invalid_ptr<T>(addr: usize) -> *mut T {
-    let ptr = core::ptr::null_mut::<u8>().wrapping_add(addr);
-    debug_assert_eq!(ptr as usize, addr);
-    ptr.cast::<T>()
-}
 
 /// Precondition: dst >= original
 ///
@@ -1664,70 +1478,7 @@ fn offset_from(dst: *mut u8, original: *mut u8) -> usize {
     dst as usize - original as usize
 }
 
-unsafe fn rebuild_vec(ptr: *mut u8, mut len: usize, mut cap: usize, off: usize) -> Vec<u8> {
-    let ptr = ptr.offset(-(off as isize));
-    len += off;
-    cap += off;
 
-    Vec::from_raw_parts(ptr, len, cap)
-}
-
-// ===== impl SharedVtable =====
-
-struct SharedImpl {
-    shared: *mut Shared,
-    ptr: *const u8,
-    len: usize,
-}
-
-unsafe impl RefCountBuf for SharedImpl {
-    fn into_parts(this: Self) -> (RefCountPtr, *const u8, usize) {
-        (AtomicPtr::new(this.shared.cast()), this.ptr, this.len)
-    }
-
-    unsafe fn from_parts(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Self {
-        SharedImpl {
-            shared: (data.with_mut(|p| *p)).cast(),
-            ptr,
-            len,
-        }
-    }
-
-    unsafe fn clone(data: &RefCountPtr, ptr: *const u8, len: usize) -> Parts {
-        let shared = data.load(Ordering::Relaxed) as *mut Shared;
-        increment_shared(shared);
-
-        (AtomicPtr::new(shared.cast()), ptr, len)
-    }
-
-    unsafe fn into_vec(data: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
-        let shared: *mut Shared = (data.with_mut(|p| *p)).cast();
-
-        if (*shared).is_unique() {
-            let shared = &mut *shared;
-
-            // Drop shared
-            let mut vec = mem::replace(&mut shared.vec, Vec::new());
-            release_shared(shared);
-
-            // Copy back buffer
-            ptr::copy(ptr, vec.as_mut_ptr(), len);
-            vec.set_len(len);
-
-            vec
-        } else {
-            let v = slice::from_raw_parts(ptr, len).to_vec();
-            release_shared(shared);
-            v
-        }
-    }
-
-    unsafe fn drop(data: &mut RefCountPtr, _ptr: *const u8, _len: usize) {
-        data.with_mut(|shared| {
-            release_shared(*shared as *mut Shared);
-        });
-    }
-}
 
 // compile-fails
 

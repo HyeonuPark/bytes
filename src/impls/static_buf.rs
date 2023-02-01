@@ -1,46 +1,49 @@
-use crate::refcount_buf::{Parts, RefCountBuf, RefCountBufError, RefCountPtr};
+use crate::refcount_buf::{RefCountBuf, RefCountBufError, RefCountPtr};
 use core::{ptr, slice, usize};
-use crate::refcount_buf::{ RefCountBuf, Parts };
-use alloc::vec::Vec;
+use alloc::{ boxed::Box, vec::Vec };
+
 // ===== impl StaticVtable =====
 
 pub struct StaticImpl(pub &'static [u8]);
 
 unsafe impl RefCountBuf for StaticImpl {
 
-    fn as_parts(&self) ->  Parts {
+    fn slice(&self) -> (*const u8, usize) {
         let ptr : *const dyn RefCountBuf = self as &dyn RefCountBuf;
-        let data = unsafe { RefCountPtr::new(std::mem::transmute(ptr)) };
-        (data,
-        self.0.as_ptr(),
+        (self.0.as_ptr(),
         self.0.len(),)
     }
 
-    unsafe fn clone(&self, data: &RefCountPtr, ptr: *const u8, len: usize) -> (&RefCountPtr, *const u8, usize) {
+    unsafe fn clone(&self, ptr: *const u8, len: usize) -> (Option<Box<dyn RefCountBuf>>, *const u8, usize) {
         let slice = slice::from_raw_parts(ptr, len);
         
-        (data, slice.as_ptr(), slice.len())
+        (None, slice.as_ptr(), slice.len())
     }
 
-    unsafe fn into_vec(&self, _: &mut RefCountPtr, ptr: *const u8, len: usize) -> Vec<u8> {
+    unsafe fn into_vec(&mut self, ptr: *const u8, len: usize) -> Vec<u8> {
         let slice = slice::from_raw_parts(ptr, len);
         slice.to_vec()
     }
 
     unsafe fn try_resize(
         &self,
-
         ptr: *const u8,
         len: usize,
         can_alloc: bool,
-    ) -> Result<(), RefCountBufError> {
-        let data = k  
+    ) -> Result<Option<Box<dyn RefCountBuf>>, RefCountBufError> {
+        Ok(None) 
     }
 
-    //unsafe fn try_into_mut(&self, can_alloc: bool) -> Result<Parts, RefCountBufError> {
-    //}
+    unsafe fn try_into_mut(
+        &self,
+        ptr: *const u8,
+        len: usize,
+        can_alloc: bool,
+    ) -> Result<Option<Box<dyn RefCountBuf>>, RefCountBufError> {
+        Ok(None) 
+    }
 
-    unsafe fn drop(_: &mut RefCountPtr, _: *const u8, _: usize) {
+    unsafe fn drop(&mut self, _: *const u8, _: usize) {
         // nothing to drop for &'static [u8]
     }
 }
